@@ -8,24 +8,29 @@
 -- LJArrays are very similar to C++ vectors. They:
 --  - consist of LuaJIT 'cdata': Their elements are plain C primitives or 
 --    structures.
---  - are homogenous: All elements have the same type, which is fixed when
---    the LJArray is instantiated (e.g. double or int)
+--  - are homogenous: All elements have the same type, which is fixed
+--    before the LJArray is instantiated (e.g. double or int).
 --  - support dynamic resizing (element count may change after the LJArray
---    is instantiated)
+--    is instantiated); see 'clear', 'reserve' and 'shrink' methods.
 --  - have a capacity (array.cap) different from their current element
 --    count (array.cnt), to avoid excessive memory reallocation.
 --
--- Note:
--- The length operator emulates the behavior of ordinary Lua-tables,      
--- returning the highest populated index (or -1) as a Lua-Number.      
+-- Length operator #:
+-- The length operator (#array) emulates the behavior of ordinary Lua-
+-- tables, returning the highest populated index (or -1) as a Lua-Number.
 -- This is *not* the number of elements (array.cnt), which might be      
 -- an uint64_t (size_t).
+--
+-- Garbage collection:
+-- A finalizer for elements can be passed as 2nd parameter when the array-
+-- type is created. Arrays with a finalizer disable the finalizer on new
+-- elements they aquire (!!). This is to avoid finalizing data twice.
 --
 -- Implicit initialization (LJArrays consisting of struct/pointer only):
 -- When values at indices above array.cnt are set/inserted, all
 -- elements inbetween are implicitly initialized: If the element
--- type has a __new metafunction ("constructor"), then this this
--- constructor is called for each implicitly initialized element.
+-- type has a __new metafunction ("constructor"), then that constructor
+-- is called for each implicitly initialized element.
 --
 -- Overhead and caching:
 -- Requesting an array with a unique ctype results in generating the
@@ -45,15 +50,23 @@
 -- Errors: 
 -- When reallocation fails, an assertion is triggered (but the ljarray
 -- is left in a consistent state).
+--
+-- API:
+-- The return value of the ljarray-module is a combined factory-function and
+-- lookup table. When called with a ct (a C type specification); preferably
+-- a string describing the type, but may also be an instance of the desired
+-- type, or a ctype (result of ffi.typeof).
+-- 2nd parameter is a function that gets called on each element when the 
+-- array itself is cleared or garbage collected.
 ------------------------------------------------------------------------------
 
 local ffi = require'ffi'
 local bit = require'bit'
 
-local assert = assert
+local assert, rawget = assert, rawget
 local tonumber, tostring, format = tonumber, tostring, string.format
 local bor, rshift = bit.bor, bit.rshift
-local C, new, fill = ffi.C, ffi.new, ffi.fill
+local C, new, fill, gc = ffi.C, ffi.new, ffi.fill, ffi.gc
 local typeof, sizeof, metatype = ffi.typeof, ffi.sizeof, ffi.metatype
 
 ffi.cdef[[
@@ -80,6 +93,18 @@ local ljarray_new_type = function(lja_cache, ct, gc_element)
   local el_size = sizeof(el_type)
   local el_gc = gc_element
   
+  if not el_gc and rawget(lja_cache, ct) then
+    return rawget(lja_cache, ct)
+  end
+  
+  --take ownership of an element (remove finalizer if we have one ourselves)
+  local function take_over(el)
+    if el_gc then
+      return gc(el, nil)
+    end
+    return el
+  end
+  
   local reserve = function(v, cap)
     if cap > v.cap then
       local bytecap = size_roundup(cap * el_size)
@@ -91,7 +116,7 @@ local ljarray_new_type = function(lja_cache, ct, gc_element)
   end
   
   local free = function(v, gc_element)
-    gc_element = gc_element or el_gc
+    gc_element = gc_element ~= nil and gc_element or el_gc
     if gc_element ~= nil then
       local i = v.cnt
       if i > 0 then repeat
@@ -110,7 +135,7 @@ local ljarray_new_type = function(lja_cache, ct, gc_element)
     insert = function(v, pos, el)
       if el == nil then
         el = pos
-        pos = v.cnt
+        pos = v.cnt > 0 and v.cnt or 1
       end
     
       if pos == v.cnt then
@@ -125,17 +150,31 @@ local ljarray_new_type = function(lja_cache, ct, gc_element)
         --implicitly initialized elements
         local i = v.cnt
         repeat
-          v.data[i] = el_type()
+          v.data[i] = take_over(el_type())
           i = i + 1
         until i == pos
         v.cnt = pos + 1
       end
-      v.data[pos] = el
+      v.data[pos] = take_over(el)
     end,
-    set_element_gc = function(v, f)
-      el_gc = f
+    remove = function(v, pos)
+      if not pos then
+        --remove last element
+        pos = v.cnt - 1
+        v.cnt = v.cnt - 1
+        return v.data[pos]
+      end
+      if pos < 0 or pos >= v.cnt then
+        return nil
+      end
+      local el = v.data[pos]
+      if pos < v.cnt-1 then
+        C.memmove(v.data + pos, v.data + pos + 1, (v.cnt - pos - 1) * el_size);
+      end
+      v.cnt = v.cnt - 1
+      return el
     end,
-    free = free,
+    clear = free,
     shrink = function(v)
       if v.cap > v.cnt then
         local buf = C.realloc(v.data, v.cnt * el_size)
@@ -146,30 +185,33 @@ local ljarray_new_type = function(lja_cache, ct, gc_element)
     end,
   }
   
-  lja_cache[el_type] = metatype(typeof([[struct {
+  local con = metatype(typeof([[struct {
     $ *data;
     size_t cnt;
     size_t cap;
   }]], el_type), {
     __index = function(v, k)
-      return methods[k] or v.data[k]
+      return methods[k] or k < v.cnt and v.data[k] or nil
     end,
     __newindex = function(v, k, el)
       v:reserve(k+1)
       
-      v.data[k] = el
-      if k == v.cnt then
+      if k < v.cnt and el_gc then
+        el_gc(v.data[k])
+        v.data[k] = take_over(el)
+      elseif k == v.cnt then
+        v.data[k] = take_over(el)
         v.cnt = k + 1
       elseif k > v.cnt then
         local i = v.cnt
         repeat
-          v.data[i] = el_type()
+          v.data[i] = take_over(el_type())
           i = i + 1
         until i == k
+        v.data[k] = take_over(el)
         v.cnt = k + 1
       end
     end,
-    __call = index,
     __new = function(vec_ct, cap)
       local v = new(vec_ct)
       if cap then
@@ -186,7 +228,12 @@ local ljarray_new_type = function(lja_cache, ct, gc_element)
           tonumber(v.cnt), tonumber(v.cap))
     end,
   })
-  return lja_cache[el_type]
+  
+  if el_gc then
+    return con
+  end
+  lja_cache[ct] = con
+  return con
 end
 
 local lja_cache = setmetatable({}, {
