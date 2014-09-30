@@ -25,7 +25,7 @@ print(v[6]) --> out of bounds-access returns nil
 
 ## API
 
-**``array_constructor = ljarray(ct [,gc_element])``**
+<b>``array_constructor = ljarray(ct [,gc_element])``</b>
 
 The table returned by require'ljarray' is callable and works as factory-
 function. When a 'gc_element'- function is supplied, ljarray *always*
